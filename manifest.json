@@ -1,11 +1,16 @@
 {
   "manifest_version": 3,
   "name": "PolyChat 多语言聊天翻译助手",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "在 Facebook 和 Messenger 中自动显示双语译文，并使用自定义 API 生成可复制的多语言回复。",
   "permissions": [
     "activeTab",
+    "scripting",
     "storage"
+  ],
+  "host_permissions": [
+    "https://*.facebook.com/*",
+    "https://*.messenger.com/*"
   ],
   "optional_host_permissions": [
     "http://*/*",

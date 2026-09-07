@@ -17,12 +17,35 @@ document.getElementById("rescan").addEventListener("click", () => sendToPage("PO
 async function sendToPage(type, successMessage) {
   try {
     const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
-    if (!tab?.id) throw new Error();
-    const response = await chrome.tabs.sendMessage(tab.id, { type });
+    if (!tab?.id || !isSupportedPage(tab.url)) throw new Error();
+
+    let response;
+    try {
+      response = await chrome.tabs.sendMessage(tab.id, { type });
+    } catch {
+      // Edge occasionally skips declarative content-script injection on an
+      // already-open Facebook tab. Inject once on demand, then retry.
+      await chrome.scripting.executeScript({
+        target: { tabId: tab.id },
+        files: ["src/content.js"]
+      });
+      response = await chrome.tabs.sendMessage(tab.id, { type });
+    }
+
     if (!response?.ok) throw new Error();
     showStatus(successMessage, "success");
   } catch {
     showStatus("请先打开或刷新 Facebook / Messenger 页面", "error");
+  }
+}
+
+function isSupportedPage(value = "") {
+  try {
+    const hostname = new URL(value).hostname;
+    return hostname === "facebook.com" || hostname.endsWith(".facebook.com") ||
+      hostname === "messenger.com" || hostname.endsWith(".messenger.com");
+  } catch {
+    return false;
   }
 }
 
