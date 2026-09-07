@@ -1,0 +1,28 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>PolyChat</title>
+  <link rel="stylesheet" href="popup.css" />
+</head>
+<body>
+  <main>
+    <header>
+      <div class="mark">译</div>
+      <div><strong>PolyChat</strong><span>自己的 API，自己的翻译助手</span></div>
+    </header>
+    <label class="toggle">
+      <span><strong>页面自动翻译</strong><small>外语原文旁显示中文</small></span>
+      <input id="autoTranslate" type="checkbox" />
+    </label>
+    <button id="open" class="primary">打开回复助手</button>
+    <div class="row">
+      <button id="rescan">重新扫描页面</button>
+      <button id="settings">API 设置</button>
+    </div>
+    <p id="status">仅支持 Facebook 和 Messenger 页面</p>
+  </main>
+  <script src="popup.js"></script>
+</body>
+</html>
