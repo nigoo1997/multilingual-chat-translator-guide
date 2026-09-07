@@ -1,7 +1,14 @@
 (() => {
-  if (window.top !== window || document.getElementById("polychat-extension-root")) {
+  if (window.top !== window || window.__polychatContentScriptLoaded) {
     return;
   }
+  window.__polychatContentScriptLoaded = true;
+
+  // An extension reload invalidates the old content-script context but leaves
+  // its DOM behind. Remove that stale shell so an on-demand reinjection can
+  // upgrade the open Facebook tab without forcing a page reload (and without
+  // losing an unsent chat draft).
+  document.getElementById("polychat-extension-root")?.remove();
 
   const LANGUAGES = [
     ["th", "泰语 · ไทย"],
@@ -31,6 +38,7 @@
     queue: [],
     queued: new WeakSet(),
     processed: new WeakMap(),
+    failures: new WeakMap(),
     active: 0,
     blockedByConfig: false,
     lastComposer: null,
@@ -238,12 +246,24 @@
       for (const mutation of mutations) {
         for (const node of mutation.addedNodes) {
           if (node instanceof Element && node !== root && !root.contains(node)) {
-            scheduleScan(node);
+            // Facebook usually adds one message as several consecutive DOM
+            // mutations. Scan the settled document once so earlier siblings in
+            // the same burst are not lost when the debounce timer is refreshed.
+            scheduleScan(document);
+            return;
           }
         }
       }
     });
     observer.observe(document.body || document.documentElement, { childList: true, subtree: true });
+
+    // Facebook virtualizes long conversations. Messages that already exist in
+    // the DOM can become visible without another useful childList mutation.
+    document.addEventListener("scroll", () => scheduleScan(document), { capture: true, passive: true });
+    window.addEventListener("resize", () => scheduleScan(document), { passive: true });
+    document.addEventListener("visibilitychange", () => {
+      if (!document.hidden) scheduleScan(document);
+    });
 
     chrome.storage.onChanged.addListener((changes, area) => {
       if (area !== "local") {
@@ -265,15 +285,24 @@
         sendResponse({ ok: true });
       } else if (message?.type === "POLYCHAT_RESCAN") {
         state.blockedByConfig = false;
-        scheduleScan(document);
+        clearPendingQueue();
+        setStatus("正在优先翻译当前可见内容…", "loading");
+        scheduleScan(document, 0);
         sendResponse({ ok: true });
       }
     });
   }
 
-  function scheduleScan(scope) {
-    clearTimeout(state.scanTimer);
-    state.scanTimer = setTimeout(() => scan(scope), 350);
+  function scheduleScan(_scope, delay = 220) {
+    if (state.scanTimer) {
+      if (delay > 0) return;
+      clearTimeout(state.scanTimer);
+      state.scanTimer = null;
+    }
+    state.scanTimer = setTimeout(() => {
+      state.scanTimer = null;
+      scan(document);
+    }, delay);
   }
 
   function scan(scope) {
@@ -287,10 +316,17 @@
     if (scope.querySelectorAll) {
       candidates.push(...scope.querySelectorAll("[dir='auto'], [lang]"));
     }
-    for (const element of candidates) {
-      if (isCandidate(element)) {
-        enqueue(element);
-      }
+    pruneQueue();
+
+    const ready = [...new Set(candidates)]
+      .filter((element) => isNearViewport(element) && isCandidate(element))
+      // Prefer what the user can currently see, with the newest/lower chat
+      // messages before content near the edge of the prefetch margin.
+      .sort((a, b) => viewportPriority(b) - viewportPriority(a))
+      .slice(0, 80);
+
+    for (const element of ready) {
+      enqueue(element);
     }
     drainQueue();
   }
@@ -299,13 +335,20 @@
     if (!(element instanceof HTMLElement) || root.contains(element)) {
       return false;
     }
+    if (element.closest("[data-polychat-translation='true']")) {
+      return false;
+    }
     if (element.closest("input, textarea, select, [contenteditable='true'], button, [role='button'], nav, header, [role='navigation']")) {
       return false;
     }
     if (!element.closest("[role='article'], [role='dialog'], [role='main'], [data-pagelet*='FeedUnit']")) {
       return false;
     }
-    if ([...element.children].some((child) => child.innerText?.trim())) {
+
+    // Use the deepest semantic language node. Do not reject a message merely
+    // because Facebook wraps its text in one or more plain <span> elements.
+    if ([...element.querySelectorAll("[dir='auto'], [lang]")]
+      .some((child) => normalizedText(child.innerText || child.textContent || ""))) {
       return false;
     }
 
@@ -326,7 +369,10 @@
     }
 
     const signature = `${state.settings.readTarget}|${text}`;
-    return state.processed.get(element) !== signature && !state.queued.has(element);
+    const failure = state.failures.get(element);
+    return state.processed.get(element) !== signature &&
+      !state.queued.has(element) &&
+      !(failure?.signature === signature && failure.until > Date.now());
   }
 
   function enqueue(element) {
@@ -336,7 +382,7 @@
   }
 
   function drainQueue() {
-    while (state.active < 2 && state.queue.length) {
+    while (state.active < 3 && state.queue.length) {
       const job = state.queue.shift();
       state.active += 1;
       translateElement(job)
@@ -350,25 +396,34 @@
   }
 
   async function translateElement(job) {
-    if (!job.element.isConnected || normalizedText(job.element.innerText || job.element.textContent || "") !== job.text) {
+    if (!job.element.isConnected || !isNearViewport(job.element) ||
+      normalizedText(job.element.innerText || job.element.textContent || "") !== job.text) {
       return;
     }
-    state.processed.set(job.element, job.signature);
 
-    const response = await chrome.runtime.sendMessage({
-      type: "POLYCHAT_TRANSLATE",
-      payload: {
-        mode: "read",
-        source: "auto",
-        target: state.settings.readTarget,
-        text: job.text
-      }
-    });
+    let response;
+    try {
+      response = await chrome.runtime.sendMessage({
+        type: "POLYCHAT_TRANSLATE",
+        payload: {
+          mode: "read",
+          source: "auto",
+          target: state.settings.readTarget,
+          text: job.text
+        }
+      });
+    } catch (error) {
+      recordFailure(job, error?.message || String(error));
+      return;
+    }
 
     if (!response?.ok) {
       if (/尚未配置|API 地址|模型名称/.test(response?.error || "")) {
         state.blockedByConfig = true;
+        clearPendingQueue();
         setStatus("请先在设置中配置 API", "error");
+      } else {
+        recordFailure(job, response?.error || "翻译失败");
       }
       return;
     }
@@ -393,6 +448,56 @@
       job.element.insertAdjacentElement("afterend", translation);
     }
     translation.textContent = response.result;
+    state.processed.set(job.element, job.signature);
+    state.failures.delete(job.element);
+  }
+
+  function clearPendingQueue() {
+    for (const job of state.queue) {
+      state.queued.delete(job.element);
+    }
+    state.queue = [];
+  }
+
+  function pruneQueue() {
+    const kept = [];
+    for (const job of state.queue) {
+      const currentText = normalizedText(job.element.innerText || job.element.textContent || "");
+      if (job.element.isConnected && isNearViewport(job.element) && currentText === job.text) {
+        kept.push(job);
+      } else {
+        state.queued.delete(job.element);
+      }
+    }
+    state.queue = kept.sort((a, b) => viewportPriority(b.element) - viewportPriority(a.element));
+  }
+
+  function isNearViewport(element) {
+    const rect = element.getBoundingClientRect();
+    const margin = 500;
+    return rect.width > 0 && rect.height > 0 &&
+      rect.bottom >= -margin && rect.top <= window.innerHeight + margin &&
+      rect.right >= -margin && rect.left <= window.innerWidth + margin;
+  }
+
+  function viewportPriority(element) {
+    const rect = element.getBoundingClientRect();
+    const visible = rect.bottom >= 0 && rect.top <= window.innerHeight &&
+      rect.right >= 0 && rect.left <= window.innerWidth;
+    return (visible ? 1_000_000 : 0) + Math.min(rect.bottom, window.innerHeight + 500);
+  }
+
+  function recordFailure(job, message) {
+    const previous = state.failures.get(job.element);
+    const attempts = previous?.signature === job.signature ? previous.attempts + 1 : 1;
+    const delay = Math.min(60_000, 4_000 * (2 ** (attempts - 1)));
+    state.failures.set(job.element, {
+      signature: job.signature,
+      attempts,
+      until: Date.now() + delay
+    });
+    setStatus(`页面翻译暂时失败，稍后自动重试：${String(message).slice(0, 120)}`, "error");
+    setTimeout(() => scheduleScan(document, 0), delay + 50);
   }
 
   function detectScript(text) {

@@ -1,8 +1,11 @@
 const autoTranslate = document.getElementById("autoTranslate");
 const status = document.getElementById("status");
 
-chrome.storage.local.get({ autoTranslate: true }).then((settings) => {
+chrome.storage.local.get({ autoTranslate: true, apiUrl: "", model: "" }).then((settings) => {
   autoTranslate.checked = Boolean(settings.autoTranslate);
+  if (!settings.apiUrl || !settings.model) {
+    showStatus("尚未配置 API 地址或模型，请先打开 API 设置", "error");
+  }
 });
 
 autoTranslate.addEventListener("change", async () => {
@@ -12,7 +15,7 @@ autoTranslate.addEventListener("change", async () => {
 
 document.getElementById("settings").addEventListener("click", () => chrome.runtime.openOptionsPage());
 document.getElementById("open").addEventListener("click", () => sendToPage("POLYCHAT_OPEN_ASSISTANT", "回复助手已打开"));
-document.getElementById("rescan").addEventListener("click", () => sendToPage("POLYCHAT_RESCAN", "已重新扫描页面"));
+document.getElementById("rescan").addEventListener("click", () => sendToPage("POLYCHAT_RESCAN", "已优先扫描当前可见消息"));
 
 async function sendToPage(type, successMessage) {
   try {
